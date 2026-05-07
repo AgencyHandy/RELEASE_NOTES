@@ -65,12 +65,11 @@ def summarize_description(body: str) -> str:
         return ""
     sentences = re.split(r'[.!?]+', cleaned)
     first_sentence = sentences[0].strip() if sentences else ""
-    
+
     first_sentence = re.sub(r'^(we have|we added|users can|now you can|should now)', '', first_sentence, flags=re.IGNORECASE).strip()
     first_sentence = first_sentence[0].upper() + first_sentence[1:] if first_sentence else first_sentence
-    
-    if len(first_sentence) > 150:
-        first_sentence = first_sentence[:147] + "..."
+
+    # Let LLM handle truncation naturally - don't artificially truncate
     return first_sentence
 
 
@@ -80,7 +79,17 @@ def call_llm_summarize(text: str, llm_api_url: str, llm_api_key: str) -> Optiona
 
     try:
         headers = {"api-key": llm_api_key, "Content-Type": "application/json"}
-        payload = {"model": "gpt-5.4", "messages": [{"role": "user", "content": f"Write a simple, user-friendly release note (max 20 words). Write like you're explaining to a regular customer, not a developer. No technical jargon. Focus on what the user can DO or SEE after this change. If the change is internal/infrastructure/no-user-impact, respond with exactly 'INTERNAL': {text}"}], "max_completion_tokens": 60}
+        payload = {"model": "gpt-5.4", "messages": [{"role": "user", "content": f"""You are writing release notes for NON-TECHNICAL USERS (customers).
+
+CRITICAL RULES:
+- NEVER use these words: migration, script, API, backend, frontend, endpoint, PR, commit, branch, repo, database, ticket, convert, fix/, feat/, chore/
+- Write ONLY about what the USER can SEE or DO after this change
+- Keep it to 1 sentence, maximum 15 words
+- If no user-facing change exists, respond with exactly: INTERNAL
+
+Input: {text}
+
+Output (user-friendly, no technical jargon):"""}], "max_completion_tokens": 60}
         resp = requests.post(llm_api_url, json=payload, headers=headers, timeout=15)
         if resp.status_code != 200:
             return None
@@ -90,6 +99,79 @@ def call_llm_summarize(text: str, llm_api_url: str, llm_api_key: str) -> Optiona
         # Try several common response shapes
         if isinstance(data, dict):
             for key in ("summary", "result", "output", "text"):
+                if key in data and isinstance(data[key], str):
+                    result = data[key].strip()
+                    # Validate output - if it contains technical jargon, reject it
+                    if any(word in result.lower() for word in ['migration', 'script', 'api', 'backend', 'repo', 'ticket', 'fix/', 'feat/']):
+                        return None
+                    return result
+
+            # OpenAI-like
+            if "choices" in data and isinstance(data["choices"], list) and data["choices"]:
+                c0 = data["choices"][0]
+                if isinstance(c0, dict):
+                    if "text" in c0 and isinstance(c0["text"], str):
+                        result = c0["text"].strip()
+                        if any(word in result.lower() for word in ['migration', 'script', 'api', 'backend', 'repo', 'ticket']):
+                            return None
+                        return result
+                    if "message" in c0 and isinstance(c0["message"], dict):
+                        msg = c0["message"].get("content")
+                        if isinstance(msg, str):
+                            if any(word in msg.lower() for word in ['migration', 'script', 'api', 'backend', 'repo', 'ticket']):
+                                return None
+                            return msg.strip()
+
+            # Some hosts return results array
+            if "results" in data and isinstance(data["results"], list) and data["results"]:
+                r0 = data["results"][0]
+                if isinstance(r0, dict):
+                    for key in ("output", "content", "text"):
+                        if key in r0 and isinstance(r0[key], str):
+                            result = r0[key].strip()
+                            if any(word in result.lower() for word in ['migration', 'script', 'api', 'backend', 'repo', 'ticket']):
+                                return None
+                            return result
+
+        # Last resort: try plain text body
+        text_body = resp.text
+        if text_body:
+            text_body = text_body.strip()
+            if any(word in text_body.lower() for word in ['migration', 'script', 'api', 'backend', 'repo', 'ticket']):
+                return None
+            return text_body[:200]
+
+    except Exception:
+        return None
+
+    return None
+
+
+def call_llm_make_title(text: str, llm_api_url: str, llm_api_key: str) -> Optional[str]:
+    if not text or not llm_api_url or not llm_api_key:
+        return None
+
+    try:
+        headers = {"api-key": llm_api_key, "Content-Type": "application/json"}
+        payload = {"model": "gpt-5.4", "messages": [{"role": "user", "content": f"""Rewrite this as a SHORT (5-8 words), user-friendly title.
+CRITICAL: Remove ALL technical terms: migration, script, ticket, fix/, feat/, chore/, API, backend, endpoint, PR, commit, branch, repo, refactor, convert.
+Focus on WHAT THE USER SEES OR CAN DO.
+Write like you're telling a regular customer what's new.
+
+Examples:
+- "Add migration script for subscriptions" → "Cancel expired subscriptions automatically"
+- "Fix/ticket convert copy attachments" → "Copy attachments when converting"
+
+Text: {text}"""}], "max_completion_tokens": 40}
+        resp = requests.post(llm_api_url, json=payload, headers=headers, timeout=15)
+        if resp.status_code != 200:
+            return None
+
+        data = resp.json()
+
+        # Try several common response shapes
+        if isinstance(data, dict):
+            for key in ("title", "summary", "result", "output", "text"):
                 if key in data and isinstance(data[key], str):
                     return data[key].strip()
 
@@ -115,7 +197,7 @@ def call_llm_summarize(text: str, llm_api_url: str, llm_api_key: str) -> Optiona
         # Last resort: try plain text body
         text_body = resp.text
         if text_body:
-            return text_body.strip()[:200]
+            return text_body.strip()[:100]
 
     except Exception:
         return None
@@ -139,6 +221,49 @@ def is_security_sensitive(text: str) -> bool:
     return False
 
 
+def make_user_friendly_title(title: str, llm_api_url: Optional[str] = None, llm_api_key: Optional[str] = None) -> str:
+    # Try LLM first if available
+    if llm_api_url and llm_api_key:
+        llm_title = call_llm_make_title(title, llm_api_url, llm_api_key)
+        if llm_title:
+            # Capitalize first letter if LLM didn't
+            if llm_title:
+                llm_title = llm_title[0].upper() + llm_title[1:] if llm_title else llm_title
+            return llm_title
+
+    # Fallback: Aggressively clean the title
+    # Remove conventional commit prefixes (including common types)
+    title = re.sub(r'^(feat|fix|refactor|enh|chore|docs|style|test)(\([^)]*\))?:\s*', '', title, flags=re.IGNORECASE).strip()
+
+    # Remove technical jargon that is not user-facing
+    tech_patterns = [
+        r'\bapi\b', r'\bendpoint\b', r'\bbackend\b', r'\bfrontend\b', r'\bpr\b',
+        r'\bcommit\b', r'\bdb\b', r'\bdatabase\b', r'\brepo\b', r'\brepository\b',
+        r'\bmerge\b', r'\bbranch\b', r'\bpull request\b', r'\bslack\b', r'\bwebhook\b',
+        r'\bmigration\b', r'\bscript\b', r'\bticket\b', r'\bconvert\b', r'\bcopy\b',
+        r'\bFix\b', r'\bfix/\b', r'\bfeat/\b', r'\bchore/\b'
+    ]
+    for pattern in tech_patterns:
+        title = re.sub(pattern, '', title, flags=re.IGNORECASE)
+
+    # Remove "Add migration script for..." type patterns
+    title = re.sub(r'^(add|update|fix|remove|delete|modify)\s+', '', title, flags=re.IGNORECASE)
+
+    # Clean up extra whitespace and punctuation left behind
+    title = re.sub(r'\s+', ' ', title).strip()
+    title = re.sub(r'^\W+|\W+$', '', title).strip()
+
+    # Capitalize first letter
+    if title:
+        title = title[0].upper() + title[1:]
+
+    # Fallback if title is empty after processing
+    if not title:
+        title = "App improvements and updates"
+
+    return title
+
+
 def get_combined_text(title: str, body: str, commits: str) -> str:
     parts = []
     if title:
@@ -150,26 +275,110 @@ def get_combined_text(title: str, body: str, commits: str) -> str:
     return " | ".join(parts)
 
 
+def generate_user_friendly_internal_summary(title: str) -> str:
+    return make_user_friendly_title(title)
+
+
 def generate_summary(title: str, body: str, commits: str, llm_api_url: Optional[str], llm_api_key: Optional[str]) -> str:
-    combined = get_combined_text(title, body, commits)
-    cleaned = clean_description(combined)
-    if not cleaned:
+    # Get the user-friendly title first
+    friendly_title = make_user_friendly_title(title, llm_api_url, llm_api_key)
+
+    if not friendly_title or friendly_title == "App improvements and updates":
         return ""
 
-    if is_security_sensitive(cleaned):
-        return "[Internal change - not visible to users]"
+    if is_security_sensitive(friendly_title):
+        return ""
 
+    # Try LLM to generate a DIFFERENT summary sentence (not the same as title)
     if llm_api_key and llm_api_url:
-        remote = call_llm_summarize(cleaned, llm_api_url, llm_api_key)
-        if remote:
-            if is_security_sensitive(remote):
-                return "[Internal change - not visible to users]"
-            return remote if len(remote) <= 200 else remote[:197] + "..."
+        llm_input = f"Write a ONE-SENTENCE summary (max 12 words) that is DIFFERENT from the title. Focus on the BENEFIT to users, not just repeating the title. Title: '{friendly_title}'"
 
-    first_sentence = summarize_description(cleaned)
-    if is_security_sensitive(first_sentence):
-        return "[Internal change - not visible to users]"
-    return first_sentence
+        remote = call_llm_summarize(llm_input, llm_api_url, llm_api_key)
+        if remote and remote.strip().upper() != "INTERNAL":
+            remote_clean = remote.strip()
+            # Reject if it's the same as title or generic
+            if remote_clean.lower() != friendly_title.lower():
+                generic_phrases = ['now available for all users', 'now available', 'improvements and updates',
+                                'backend improvements', 'no description', 'internally updated']
+                if not is_security_sensitive(remote_clean):
+                    if not any(phrase in remote_clean.lower() for phrase in generic_phrases):
+                        return remote_clean
+
+    # Fallback: Return empty - just show the title without summary
+    return ""
+
+
+def _make_benefit_from_title(title: str) -> str:
+    """Generate a benefit statement that's DIFFERENT from the title."""
+    title_lower = title.lower()
+
+    # Pattern: "Cancel X automatically" -> "No manual work needed for X"
+    if 'automatically' in title_lower:
+        # Extract what's being done automatically
+        words = title.split()
+        if 'automatically' in words:
+            idx = words.index('automatically')
+            if idx > 0:
+                action = ' '.join(words[:idx])
+                return f"No manual action needed to {action}"
+
+    # Pattern: "Copy X when Y" -> "X are now copied automatically when Y"
+    if title_lower.startswith('copy '):
+        return f"{title} - no manual work needed"
+
+    # Pattern: "Improve X" -> "X now improved"
+    if title_lower.startswith('improve '):
+        feature = title[8:].strip()
+        return f"{feature[0].upper() + feature[1:]} now improved"
+
+    # Pattern: "Fix X" -> "X now fixed"
+    if title_lower.startswith('fix '):
+        issue = title[4:].strip()
+        return f"{issue[0].upper() + issue[1:]} now fixed"
+
+    # Pattern: "Add X" -> "X now available"
+    if title_lower.startswith('add '):
+        feature = title[4:].strip()
+        return f"{feature[0].upper() + feature[1:]} now available"
+
+    # Default: Return a generic benefit that's different from title
+    return "No manual action needed"
+
+
+def _make_benefit_statement(title: str) -> str:
+    """Convert a user-friendly title into a benefit statement."""
+    title_lower = title.lower()
+
+    # Handle "automatically" patterns - the title itself is the benefit
+    if 'automatically' in title_lower:
+        return title
+
+    # For specific patterns, create meaningful benefit statements
+    if 'cancel' in title_lower:
+        return "Expired subscriptions are now cancelled automatically"
+
+    if 'copy' in title_lower and 'attachment' in title_lower:
+        return "Attachments are now copied when converting"
+
+    if 'copy' in title_lower:
+        return "Items are now copied automatically"
+
+    # If title starts with a verb, create a benefit statement
+    verbs = ['cancel', 'copy', 'add', 'update', 'fix', 'delete', 'remove', 'create', 'edit', 'manage', 'view']
+    for verb in verbs:
+        if title_lower.startswith(verb):
+            # Convert verb to past tense and make it a benefit
+            past_tense = {
+                'cancel': 'cancelled', 'copy': 'copied', 'add': 'added', 'update': 'updated',
+                'fix': 'fixed', 'delete': 'deleted', 'remove': 'removed', 'create': 'created',
+                'edit': 'edited', 'manage': 'managed', 'view': 'now visible'
+            }
+            rest_of_title = title[len(verb):].strip()
+            if verb in past_tense:
+                return f"{rest_of_title[0].upper() + rest_of_title[1:] if rest_of_title else rest_of_title} {past_tense[verb]}"
+
+    # Default: Use the title itself (it's already user-friendly)
+    return title
 
 
 def categorize_pr(pr_branch: str, pr_title: str, pr_labels: list) -> str:
@@ -329,8 +538,10 @@ def group_by_title_similarity(entries: list[dict]) -> list[list[dict]]:
 def process_single_pr(pr: dict, llm_api_url: Optional[str], llm_api_key: Optional[str]) -> dict:
     summary = generate_summary(pr['title'], pr['body'], pr.get('commits', ''), llm_api_url, llm_api_key)
     category = categorize_pr(pr['branch'], pr['title'], pr['labels'])
+    friendly_title = make_user_friendly_title(pr['title'], llm_api_url, llm_api_key)
     return {
         'title': pr['title'],
+        'friendly_title': friendly_title,
         'summary': summary,
         'category': category,
         'prs': [pr],
@@ -412,17 +623,13 @@ def format_release_message(grouped_prs: dict, week_start: datetime, week_end: da
 
         for group in items:
             entry = group[0]
-            title = entry['title']
-            summary = entry.get('summary', 'No description available.')
+            friendly_title = entry.get('friendly_title', make_user_friendly_title(entry['title']))
+            summary = entry.get('summary', '').strip()
 
-            clean_title = re.sub(r'^(feat|fix|refactor|enh)(\([^)]*\))?:\s*', '', title, flags=re.IGNORECASE)
-            clean_title = clean_title.strip()
-            
-            if clean_title.lower() == 'internal':
-                continue
-
-            message += f"• **{clean_title}**\n"
-            message += f"  {summary}\n\n"
+            if summary and summary != friendly_title:
+                message += f"• **{friendly_title}**: {summary}\n\n"
+            else:
+                message += f"• **{friendly_title}**\n\n"
 
     return message
 
